@@ -32,7 +32,7 @@ const ERROR_OUTPUT_FILE = process.env.ERROR_OUTPUT_FILE || './outputs/database_i
 const PARTIAL_FILE = process.env.PARTIAL_FILE || './outputs/database_parcial.dbml';
 // Eliminamos generación de archivo separado de relaciones
 // const RELS_FILE = process.env.RELS_FILE || 'database_relaciones.dbml';
-const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE || 20);
+const SAMPLE_SIZE = Number(process.env.SAMPLE_SIZE || 40);
 const MAX_VALUE_LENGTH = Number(process.env.MAX_VALUE_LENGTH || 250);
 const TABLE_CONCURRENCY = Number(process.env.TABLE_CONCURRENCY || 4);
 const GEMINI_MAX_RETRIES = Number(process.env.GEMINI_MAX_RETRIES || 3);
@@ -124,7 +124,7 @@ async function getTableSampleData(table, schema) {
         const res = await pool.query(q);
         return res.rows;
     } catch (e) {
-        console.warn(`Muestra fallida ${schema}.${table}: ${e.message}`);
+        console.warn(`Sample failed ${schema}.${table}: ${e.message}`);
         return [];
     }
 }
@@ -272,7 +272,7 @@ function guessFkNotes(columns) {
     const guesses = {};
     for (const c of columns) {
         const name = c.column_name.toLowerCase();
-        if (/(_id|id$)/.test(name) && name !== 'id') guesses[c.column_name] = 'Posible clave foránea inferida por nombre';
+        if (/(_id|id$)/.test(name) && name !== 'id') guesses[c.column_name] = 'Possible foreign key inferred by column name';
     }
     return guesses;
 }
@@ -296,9 +296,28 @@ function mapType(pgType) {
 function escapeNote(s) {
     if (s === null || s === undefined) return '';
     if (typeof s !== 'string') {
-        try { s = JSON.stringify(s); } catch (e) { s = String(s); }
+        try { s = String(s); } catch (e) { s = ''; }
     }
     return s.replace(/\r?\n+/g, ' ').replace(/'/g, "\\'").slice(0, 800);
+}
+
+function stringifyNote(note) {
+    // Normalize any structure returned by AI into a concise English sentence
+    if (note == null) return '';
+    if (typeof note === 'string') return note.trim();
+    if (typeof note === 'object') {
+        const parts = [];
+        const meaning = note.meaning || note.descripcion || note.description;
+        if (meaning) parts.push(String(meaning));
+        const unit = note.unit || note.unidad;
+        if (unit && String(unit).toLowerCase() !== 'n/a') parts.push(`Unit: ${unit}`);
+        const domain = note.domain || note.values || note.dominio;
+        if (domain) parts.push(`Domain: ${domain}`);
+        const keyInfo = note.foreign_key_or_natural_identifier || note.is_fk_or_ni || note.key || note.identifier;
+        if (keyInfo) parts.push(`Key/identifier: ${keyInfo}`);
+        return parts.join('. ').trim();
+    }
+    return String(note);
 }
 
 function formatDefaultValue(raw, dataType) {
@@ -366,7 +385,7 @@ async function callGemini(prompt, attempt = 1) {
     } catch (e) {
         if (attempt >= GEMINI_MAX_RETRIES) throw e;
         const wait = GEMINI_RETRY_BASE_MS * Math.pow(2, attempt - 1);
-        console.warn(`Gemini fallo intento ${attempt}. Reintentando en ${wait}ms: ${e.message}`);
+        console.warn(`Gemini failed attempt ${attempt}. Retrying in ${wait}ms: ${e.message}`);
         await new Promise(r => setTimeout(r, wait));
         return callGemini(prompt, attempt + 1);
     }
@@ -374,25 +393,35 @@ async function callGemini(prompt, attempt = 1) {
 
 async function generateCommentsWithGemini(table, schema, columns, sample) {
     if (!USE_AI) return { table_description: '', columns: {} };
-    const schemaString = columns.map(c => `${c.column_name} (${c.data_type})`).join(', ');
+    const schemaString = columns.map(c => {
+        const flags = [];
+        if ((c.is_nullable || '').toUpperCase() === 'NO') flags.push('not null');
+        if (c.column_default) {
+            const dv = String(c.column_default).replace(/\s+/g, ' ').slice(0, 120);
+            flags.push(`default=${dv}`);
+        }
+        const extras = flags.length ? `; ${flags.join('; ')}` : '';
+        return `${c.column_name} (${c.data_type}${extras})`;
+    }).join(', ');
     const truncated = truncateSampleData(sample);
     const sampleString = JSON.stringify(truncated, null, 2);
-    const prompt = `Eres un experto en modelado relacional. Proporciona JSON estricto.
-Tabla: ${schema}.${table}
-Columnas: ${schemaString}
-Muestra (puede estar truncada, size=${truncated.length}):\n${sampleString}\n
-Instrucciones:
-1 Devuelve solo JSON válido.
-2 Incluye todas las columnas.
-3 Describe el rol de la tabla en el dominio.
-4 Para cada columna indica: significado, unidad si aplica, dominio de valores, y si parece clave foránea o identificador natural.
-Formato:
+    const prompt = `You are an expert in relational data modeling. Return valid JSON only.
+Table: ${schema}.${table}
+Columns: ${schemaString}
+Sample (may be truncated, size=${truncated.length}):\n${sampleString}\n
+Instructions:
+1 Return only valid JSON.
+2 Include ALL columns listed above.
+3 Provide a concise English description of the table's purpose in the domain.
+4 For each column, return a richly detailed, plain-text description in English (2–4 short sentences, a single string value, NOT an object). Cover: business meaning; typical value patterns and examples; unit if relevant; allowed ranges/enums; nullability and default (if any) as hints; whether it appears to be a primary key, foreign key (and likely referenced entity), or a natural/business key.
+5 Do NOT include markdown, lists, or JSON objects inside the string. Each value in "columns" must be a STRING.
+Format:
 {
-    "table_description":"...",
-    "columns": { "col1":"...", "col2":"..." }
+  "table_description": "...", 
+  "columns": { "col1": "One-sentence English description", "col2": "..." }
 }`;
     try {
-        console.log(`      [IA] Generando descripciones tabla ${schema}.${table} (cols=${columns.length}, muestra=${sample.length})`);
+        console.log(`      [AI] Generating descriptions for ${schema}.${table} (cols=${columns.length}, sample=${sample.length})`);
         const initial = await callGemini(prompt);
         if (!initial.columns) initial.columns = {};
         const missing = () => columns.filter(c => !initial.columns[c.column_name]);
@@ -402,8 +431,8 @@ Formato:
             attempt++;
             metrics.selectiveRetries++;
             const needList = remaining.map(c => c.column_name).join(', ');
-            console.log(`        [IA] Reintento selectivo #${attempt} faltan (${remaining.length}): ${needList}`);
-            const followPrompt = `Añade solo las columnas faltantes en JSON. Tabla ${schema}.${table}. Columnas faltantes: ${needList}. Formato: { "columns": { "colFaltante":"descripcion" } }`;
+            console.log(`        [AI] Selective retry #${attempt} missing (${remaining.length}): ${needList}`);
+            const followPrompt = `Add only the missing columns in JSON. Table ${schema}.${table}. Missing columns: ${needList}. IMPORTANT: Each value must be a single STRING in English (2–4 short sentences) with detailed meaning, examples, domain, unit (if any), nullability/default hints, and key role (PK/FK/natural). Do NOT return objects. Format: { "columns": { "missingCol": "detailed English description" } }`;
             try {
                 const partial = await callGemini(followPrompt);
                 if (partial && partial.columns) {
@@ -419,17 +448,17 @@ Formato:
         // Rellena placeholders si aún faltan
         if (remaining.length) {
             for (const c of remaining) {
-                initial.columns[c.column_name] = 'Descripción pendiente';
+                initial.columns[c.column_name] = 'Description pending';
                 metrics.columnsPlaceholders++;
             }
-            console.log(`        [IA] Columnas con placeholder: ${remaining.map(c => c.column_name).join(', ')}`);
+            console.log(`        [AI] Columns with placeholder: ${remaining.map(c => c.column_name).join(', ')}`);
         }
-        if (!initial.table_description) initial.table_description = 'Descripción pendiente';
+        if (!initial.table_description) initial.table_description = 'Description pending';
         else metrics.tablesAI++;
         return initial;
     } catch (e) {
-        console.warn(`      [IA] Fallo generando descripciones para ${schema}.${table}: ${e.message}`);
-        return { table_description: 'No generado', columns: {} };
+        console.warn(`      [AI] Failed generating descriptions for ${schema}.${table}: ${e.message}`);
+        return { table_description: 'Not generated', columns: {} };
     }
 }
 
@@ -439,10 +468,10 @@ async function processTable(schemaName, tableName, foreignKeysIndex, pkMap) {
         columns = await getTableSchema(tableName, schemaName);
     } catch (e) {
         if (e.code === '42501' || /permission denied/i.test(e.message)) {
-            const placeholder = `// Acceso restringido: sin privilegios para leer columnas o datos\nTable ${formatTableName(schemaName, tableName)} {\n  // sin columnas visibles\n}\n\n`;
+            const placeholder = `// Access restricted: no privileges to read columns or data\nTable ${formatTableName(schemaName, tableName)} {\n  // no visible columns\n}\n\n`;
             noAccessTables.push({ schema: schemaName, table: tableName, reason: 'permission denied (columns)' });
             metrics.tablesRestricted++;
-            return { dbml: placeholder, description: 'Acceso restringido', table: tableName };
+            return { dbml: placeholder, description: 'Access restricted', table: tableName };
         }
         throw e;
     }
@@ -454,7 +483,7 @@ async function processTable(schemaName, tableName, foreignKeysIndex, pkMap) {
             noAccessTables.push({ schema: schemaName, table: tableName, reason: 'permission denied (data)' });
             metrics.tablesRestricted++;
         } else {
-            console.warn(`Muestra error no crítico ${schemaName}.${tableName}: ${e.message}`);
+            console.warn(`Non-critical sample error ${schemaName}.${tableName}: ${e.message}`);
         }
     }
     let ai = await generateCommentsWithGemini(tableName, schemaName, columns, sample);
@@ -482,7 +511,8 @@ async function processTable(schemaName, tableName, foreignKeysIndex, pkMap) {
         if (col.is_nullable.toUpperCase() === 'NO') settings.push('not null');
         if (pkCols.has(col.column_name)) settings.push('pk');
         if (USE_AI) {
-            const aiDesc = ai.columns[col.column_name];
+            const aiDescRaw = ai.columns[col.column_name];
+            const aiDesc = stringifyNote(aiDescRaw);
             if (aiDesc) settings.push(`note: '${escapeNote(aiDesc)}'`);
         }
         // Eliminamos inline ref para evitar sintaxis inválida y duplicados, relaciones se listan con Ref: posteriormente
@@ -492,7 +522,7 @@ async function processTable(schemaName, tableName, foreignKeysIndex, pkMap) {
     // Índices (composite PK y únicos) se inyectarán después externamente mediante placeholders especiales
     tableStr += '\n';
     if (USE_AI && ai.table_description) {
-        tableStr += `  Note: '${escapeNote(ai.table_description)}'\n`;
+        tableStr += `  Note: '${escapeNote(stringifyNote(ai.table_description))}'\n`;
     }
     tableStr += '}\n\n';
     return { dbml: tableStr, description: ai.table_description || '', table: tableName, columnsMeta: ai.columns, columnsRaw: columns };
