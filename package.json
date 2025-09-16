@@ -1,0 +1,21 @@
+{
+  "name": "analisys_db",
+  "version": "1.0.0",
+  "description": "",
+  "main": "generar-dbml.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@dbml/core": "^3.13.9",
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^17.2.2",
+    "mssql": "^11.0.1",
+    "mysql2": "^3.14.5",
+    "pg": "^8.16.3"
+  }
+}
